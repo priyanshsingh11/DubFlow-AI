@@ -25,7 +25,7 @@ def stage(label: str, output: Optional[Path], fn: Callable[[], None]) -> None:
 
 
 def _transcribe(audio: Path, segments_json: Path, language_txt: Path) -> None:
-    segments, language = transcribe(audio, settings.WHISPER_MODEL)
+    segments, language = transcribe(audio)
     language_txt.write_text(language)
     save_segments(segments, segments_json)
 

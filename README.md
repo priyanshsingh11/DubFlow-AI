@@ -3,13 +3,14 @@
 Turns a YouTube video in any language into an English-dubbed video.
 
 ```
-URL → download (yt-dlp) → extract audio (ffmpeg) → transcribe (faster-whisper)
+URL → download (yt-dlp) → extract audio (ffmpeg) → transcribe (Whisper large-v3 on Groq, local fallback)
     → translate (Groq LLM, Google fallback) → synthesize (edge-tts)
     → sync to original timestamps → replace audio (ffmpeg, video not re-encoded)
 ```
 
-Transcription runs locally on your machine with an open-source Whisper model.
-Translation and text-to-speech use online services.
+With a `GROQ_API_KEY`, transcription and translation run on Groq (Whisper large-v3 and an LLM).
+Without one, transcription runs locally with `faster-whisper` and translation uses Google Translate.
+Text-to-speech uses an online service.
 
 ---
 
@@ -32,8 +33,10 @@ Create a `.env` file in the project root:
 GROQ_API_KEY=your_key_here
 ```
 
-With a key, translation uses a Groq-hosted LLM. Without one, it falls back to the free
-Google Translate endpoint. `.env` is ignored by git.
+With a key, transcription uses Groq-hosted Whisper large-v3 and translation uses a Groq-hosted LLM.
+Without one, transcription runs locally (much slower on a Mac) and translation falls back to
+the free Google Translate endpoint. The key is strongly recommended: the local fallback and
+Google Translate give noticeably worse dubs, especially for Hindi. `.env` is ignored by git.
 
 ## Run
 
@@ -74,10 +77,25 @@ ffmpeg converts the audio to mono 16 kHz WAV, the format Whisper expects.
 
 ### 3. Transcribe (`app/transcriber.py`)
 
-- Uses `faster-whisper` (a CTranslate2 build of OpenAI Whisper) with `compute_type="int8"`
-  and `vad_filter=True`, which skips silent parts.
-- Detects the spoken language automatically and saves it to `language.txt`.
+- Silero VAD (bundled with `faster-whisper`) finds where people speak. The audio is cut into
+  chunks of about `CHUNK_SECONDS`, always in the middle of a pause, so no word is split.
+- Each chunk goes to `GROQ_WHISPER_MODEL` (Whisper large-v3) with word timestamps, uploaded as
+  64 kbps MP3. Without a key, or if a request fails, the chunk is transcribed locally
+  with `WHISPER_MODEL`.
+- Whisper output is cleaned up:
+  - Segments Whisper itself marks as probably not speech are dropped (hallucinations over silence or music).
+  - A word's end time is capped at `MAX_WORD_SECONDS`. Whisper often stretches the last word
+    before a pause across the whole pause.
+  - Whisper sometimes skips a stretch of speech. Any gap of `MIN_GAP_SECONDS` or more with no words, where
+    the VAD heard speech, is sent for transcription again on its own.
+- Words are regrouped into dub lines of `MIN_LINE_SECONDS`–`MAX_LINE_SECONDS`, ending at a pause
+  or punctuation where possible. Whisper's own segments can be 30 s long, far too coarse to time a dub.
+- The most common language across chunks is saved to `language.txt`.
 - Each segment (`app/models.py`) stores `id`, `start`, `end`, `source_text`, `translated_text` and `speaker`.
+
+Why not the local `small` model: on Hindi/Hinglish it produced mostly gibberish and dropped
+about 75% of the speech, and the translator then invented plausible English with no relation
+to the video.
 
 ### 4. Translate (`app/translator.py`)
 
@@ -85,15 +103,22 @@ ffmpeg converts the audio to mono 16 kHz WAV, the format Whisper expects.
 - **No `GROQ_API_KEY`:** each line goes through Google Translate (`deep-translator`).
   The free endpoint allows about 5 requests per second, so there is a 0.25 s delay between
   requests and a backoff of 5, 10, 20, 40 and 80 s when rate-limited. If it still fails,
-  the original text is kept instead of stopping the run.
-- **With `GROQ_API_KEY`:** lines are sent to `GROQ_MODEL` in batches of `TRANSLATE_BATCH`:
-  - The prompt asks for natural spoken English that keeps the speaker's tone, not a word-for-word translation.
+  the line is left silent instead of reading the untranslated text in an English voice.
+- **With `GROQ_API_KEY`:** lines are sent to the first of `GROQ_MODELS` in batches of `TRANSLATE_BATCH`:
+  - The prompt says the input is speech-recognition output from one continuous video. It may mix languages
+    and contain misheard words, and one sentence may span several lines. The model should translate for
+    meaning in natural spoken English, keep technical terms, and never add content.
   - Each line gets a `max_words` limit: the time until the next line starts × `WORDS_PER_SECOND`.
     This keeps the English short enough to fit the original timing.
-  - The previous 3 translated lines are sent as context for consistency.
+  - The previous 5 translated lines are sent as context for consistency.
   - The response is requested as JSON (`temperature=0.3`, `reasoning_effort="low"`).
-  - The Groq client retries up to 6 times on rate limits. If a whole batch fails, that
-    batch uses Google Translate. Lines missing from the LLM reply are also translated with Google.
+  - The model sometimes merges lines and leaves ids out; batches are small for that reason. Missing
+    lines (or a batch whose JSON is invalid) are requested again, up to 3 attempts, and only
+    then sent to Google Translate.
+  - When a model's daily token limit is hit (200K tokens on the free tier, about one
+    hour of video), the rest of the run uses the next model in `GROQ_MODELS`.
+  - The Groq client retries up to 6 times on rate limits. On Groq's free tier (8,000 tokens per
+    minute) this rate limit is what sets the translation speed, about 10 minutes for a 45-minute video.
 
 ### 5. Synthesize speech (`app/tts.py`)
 
@@ -103,11 +128,14 @@ ffmpeg converts the audio to mono 16 kHz WAV, the format Whisper expects.
 
 ### 6. Sync to original timing (`app/synchronizer.py`)
 
+- Leading and trailing silence is trimmed from each TTS clip.
 - Each English clip is placed at its segment's original start time.
 - A clip may use the gap before the next line, not just its own segment.
 - If a clip is still too long, ffmpeg's `atempo` speeds it up, but never beyond `MAX_SPEEDUP`
   so speech stays natural. Speed-up changes the tempo without changing the pitch.
-- All clips are mixed into one mono track at `SAMPLE_RATE`, clipped to 16-bit range.
+- Clips never overlap. If the previous clip is still playing, the next one starts when it ends
+  (and speeds up more to catch up). The largest delay behind the original is printed.
+- The clips form one mono 16-bit track at `SAMPLE_RATE`.
 
 ### 7. Replace audio
 
@@ -123,13 +151,14 @@ the new English audio as AAC.
 Set in `app/settings.py`:
 
 ```python
-WHISPER_MODEL = "small"   # tiny | base | small | medium | large-v3
+GROQ_WHISPER_MODEL = "whisper-large-v3"  # used when GROQ_API_KEY is set
+WHISPER_MODEL = "large-v3-turbo"         # local fallback
 ```
 
-It is loaded in `app/transcriber.py`:
+The local model is loaded only when it is needed (no key, or a Groq request failed):
 
 ```python
-model = WhisperModel(model_size, device="auto", compute_type="int8")
+WhisperModel(settings.WHISPER_MODEL, device="auto", compute_type="int8")
 ```
 
 ### Where the model is downloaded
@@ -140,7 +169,7 @@ the model from Hugging Face automatically:
 1. `WhisperModel.__init__` (`.venv/lib/python3.12/site-packages/faster_whisper/transcribe.py`)
    checks whether the name is a local folder. If not, it calls `download_model()`.
 2. `download_model()` (`faster_whisper/utils.py`) looks up the name in `_MODELS`,
-   e.g. `"small"` → `Systran/faster-whisper-small`.
+   e.g. `"large-v3-turbo"` → `mobiuslabsgmbh/faster-whisper-large-v3-turbo`.
 3. It calls `huggingface_hub.snapshot_download()` and fetches only `config.json`,
    `preprocessor_config.json`, `model.bin`, `tokenizer.json` and `vocabulary.*`.
 4. Files are saved to `~/.cache/huggingface/hub/models--Systran--faster-whisper-<size>/`.
@@ -166,8 +195,9 @@ Approximate figures for other sizes with `int8`:
 |-------|------|-----|-------|
 | tiny | ~75 MB | ~0.3 GB | fastest, least accurate |
 | base | ~145 MB | ~0.4 GB | |
-| **small** (default) | **~464 MB** | **~0.6–1 GB** | good balance |
+| small | ~464 MB | ~0.6–1 GB | poor on Hindi |
 | medium | ~1.5 GB | ~1.5–2 GB | |
+| **large-v3-turbo** (default) | **~1.6 GB** | **~2 GB** | close to large-v3, much faster |
 | large-v3 | ~3 GB | ~3–4 GB | most accurate, much slower on CPU |
 
 `int8` uses about half the memory of full precision, with little loss in accuracy.
@@ -188,13 +218,18 @@ rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-small
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `WHISPER_MODEL` | `"small"` | Whisper model size (see above) |
+| `GROQ_WHISPER_MODEL` | `"whisper-large-v3"` | Transcription model when `GROQ_API_KEY` is set |
+| `WHISPER_MODEL` | `"large-v3-turbo"` | Local Whisper model size (see above) |
+| `CHUNK_SECONDS` | `600` | Audio per transcription request (Groq's upload limit is 25 MB) |
+| `MIN_LINE_SECONDS` / `MAX_LINE_SECONDS` | `3` / `10` | Length range of a dub line |
+| `MAX_WORD_SECONDS` | `1.5` | Cap on a single word's duration from Whisper |
+| `MIN_GAP_SECONDS` | `4` | Word-less gap with speech in it that gets transcribed again |
 | `TTS_VOICE` | `"en-US-GuyNeural"` | Edge TTS voice; list them with `edge-tts --list-voices` |
 | `TTS_CONCURRENCY` | `8` | Parallel TTS requests |
-| `MAX_SPEEDUP` | `1.25` | Maximum speed-up for a clip that's too long |
+| `MAX_SPEEDUP` | `1.3` | Maximum speed-up for a clip that's too long |
 | `SAMPLE_RATE` | `24000` | Sample rate of the dubbed voice track |
-| `GROQ_MODEL` | `"openai/gpt-oss-120b"` | LLM used when `GROQ_API_KEY` is set |
-| `TRANSLATE_BATCH` | `30` | Segments per LLM request |
+| `GROQ_MODELS` | `["openai/gpt-oss-120b", "openai/gpt-oss-20b"]` | Translation LLMs, in order of preference |
+| `TRANSLATE_BATCH` | `12` | Segments per LLM request |
 | `WORDS_PER_SECOND` | `2.6` | English speaking pace, used for `max_words` |
 
 ## Project layout
@@ -205,7 +240,7 @@ app/
   pipeline.py        the 7 steps, with caching and timing
   downloader.py      yt-dlp download and video ID lookup
   ffmpeg.py          ffmpeg / ffprobe helpers
-  transcriber.py     faster-whisper transcription
+  transcriber.py     Whisper transcription (Groq or local) and splitting into dub lines
   translator.py      Groq LLM translation with Google Translate fallback
   tts.py             edge-tts speech synthesis
   synchronizer.py    places and speeds up clips to match timing
@@ -226,6 +261,7 @@ output/              finished dubbed videos
   `pip install -U "yt-dlp[default]"` and make sure Node or Deno is installed.
 - **"Google Translate still rate-limited":** add a `GROQ_API_KEY`, or wait and rerun;
   finished steps are cached.
-- **Transcription too slow:** use a smaller `WHISPER_MODEL` such as `base`.
+- **Transcription too slow (no key):** set a `GROQ_API_KEY`, or use a smaller `WHISPER_MODEL`
+  (accuracy drops sharply for non-English audio).
 - **Dubbed speech sounds rushed or overlaps:** lower `WORDS_PER_SECOND` so translations
   are shorter, or raise `MAX_SPEEDUP` slightly.

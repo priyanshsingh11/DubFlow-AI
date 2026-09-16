@@ -6,14 +6,20 @@ import time
 
 from deep_translator import GoogleTranslator
 from deep_translator.exceptions import TooManyRequests
-from groq import Groq
+from groq import Groq, RateLimitError
 
 from app import settings
 from app.models import Segment
 
 SYSTEM_PROMPT = """You translate video dialogue into English for dubbing.
+- The lines come from automatic speech recognition, in order, from one continuous video. They may mix languages
+  (e.g. Hindi with English words) and contain misheard words; use the surrounding lines to work out what was meant.
+- One sentence is often split across several lines. Translate each line so the English lines read naturally one after another.
 - Translate for meaning and natural spoken phrasing, not word-for-word. Keep the speaker's tone and energy.
+- Keep names, products and technical terms in their usual English form.
+- Only say what the speaker said. Never add content that isn't in the line.
 - Each line has max_words so the English fits the original timing. Stay within it; rephrase more concisely if needed, but keep the key meaning.
+- Every line is dubbed at its own time, so never merge lines: each id gets its own English text, even if short.
 - previous_lines are context only; do not translate them again.
 Return JSON: {"translations": [{"id": <id>, "text": "<english>"}]} with exactly one entry per line id."""
 
@@ -32,14 +38,11 @@ def translate(segments: list[Segment], source_language: str | None = None) -> li
 
     client = Groq(max_retries=6)  # retries with backoff on rate limits
     max_words = _max_words(segments)
+    models = list(settings.GROQ_MODELS)
     for start in range(0, len(segments), settings.TRANSLATE_BATCH):
         batch = segments[start:start + settings.TRANSLATE_BATCH]
-        context = segments[max(0, start - 3):start]
-        try:
-            _translate_llm(client, batch, context, max_words)
-        except Exception as e:  # one bad batch shouldn't stop a 2-hour run
-            print(f"\n       LLM batch failed ({e}), using Google Translate for it")
-            _translate_google(batch)
+        context = segments[max(0, start - 5):start]
+        _translate_llm(client, models, batch, context, max_words)
         print(f"\r       {min(start + len(batch), len(segments))}/{len(segments)} segments", end="", flush=True)
     print()
     return segments
@@ -54,14 +57,41 @@ def _max_words(segments: list[Segment]) -> dict[int, int]:
     return limits
 
 
-def _translate_llm(client: Groq, batch: list[Segment], context: list[Segment], max_words: dict[int, int]) -> None:
+def _translate_llm(client: Groq, models: list[str], batch: list[Segment], context: list[Segment],
+                   max_words: dict[int, int], attempts: int = 3) -> None:
+    """Ask the LLM again for any lines it skipped or merged; Google Translate is the last resort."""
+    todo = [s for s in batch if s.source_text]
+    for _ in range(attempts):
+        if not todo:
+            return
+        try:
+            by_id = _request_llm(client, models[0], todo, context, max_words)
+        except RateLimitError as e:
+            if "per day" in str(e) and len(models) > 1:
+                print(f"\n       {models[0]} daily token limit reached, switching to {models[1]}")
+                models.pop(0)  # for the rest of the run
+            else:
+                print(f"\n       LLM rate-limited ({e}), retrying")
+            by_id = {}
+        except Exception as e:  # e.g. invalid JSON; one bad reply shouldn't stop a 2-hour run
+            print(f"\n       LLM request failed ({e}), retrying")
+            by_id = {}
+        for seg in todo:
+            seg.translated_text = by_id.get(seg.id, "")
+        todo = [s for s in todo if not s.translated_text]
+    if todo:
+        print(f"\n       LLM skipped {len(todo)} lines, using Google Translate for them")
+        _translate_google(todo)
+
+
+def _request_llm(client: Groq, model: str, lines: list[Segment], context: list[Segment],
+                 max_words: dict[int, int]) -> dict[int, str]:
     payload = {
         "previous_lines": [{"source": s.source_text, "english": s.translated_text} for s in context],
-        "lines": [{"id": s.id, "text": s.source_text, "max_words": max_words[s.id]}
-                  for s in batch if s.source_text],
+        "lines": [{"id": s.id, "text": s.source_text, "max_words": max_words[s.id]} for s in lines],
     }
     response = client.chat.completions.create(
-        model=settings.GROQ_MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -70,16 +100,9 @@ def _translate_llm(client: Groq, batch: list[Segment], context: list[Segment], m
         temperature=0.3,
         reasoning_effort="low",
     )
-    translations = json.loads(response.choices[0].message.content)["translations"]
-    by_id = {int(t["id"]): t["text"].strip() for t in translations}
-
-    missing = []
-    for seg in batch:
-        if seg.id in by_id:
-            seg.translated_text = by_id[seg.id]
-        elif seg.source_text:
-            missing.append(seg)
-    _translate_google(missing)
+    data = json.loads(response.choices[0].message.content)
+    translations = data["translations"] if isinstance(data, dict) else data  # smaller models may drop the wrapper
+    return {int(t["id"]): t["text"].strip() for t in translations}
 
 
 def _translate_google(segments: list[Segment]) -> None:
@@ -89,7 +112,10 @@ def _translate_google(segments: list[Segment]) -> None:
 
 
 def _google_one(translator: GoogleTranslator, text: str, attempts: int = 5) -> str:
-    """Free Google endpoint rate-limits (5 req/s); back off, and keep the original text rather than crash."""
+    """Free Google endpoint rate-limits (5 req/s); back off, and leave the line silent rather than crash.
+
+    An untranslated line would be read out by the English voice as gibberish, so failure returns "".
+    """
     for attempt in range(attempts):
         try:
             time.sleep(0.25)
@@ -97,7 +123,7 @@ def _google_one(translator: GoogleTranslator, text: str, attempts: int = 5) -> s
         except TooManyRequests:
             time.sleep(2 ** attempt * 5)  # 5, 10, 20, 40, 80s
         except Exception as e:
-            print(f"\n       Google Translate failed ({e}), keeping original text")
-            return text
-    print("\n       Google Translate still rate-limited, keeping original text")
-    return text
+            print(f"\n       Google Translate failed ({e}), leaving line silent")
+            return ""
+    print("\n       Google Translate still rate-limited, leaving line silent")
+    return ""
