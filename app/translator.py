@@ -23,6 +23,28 @@ SYSTEM_PROMPT = """You translate video dialogue into English for dubbing.
 - previous_lines are context only; do not translate them again.
 Return JSON: {"translations": [{"id": <id>, "text": "<english>"}]} with exactly one entry per line id."""
 
+# Constrained decoding: the model can only emit JSON matching this, so no json_validate_failed errors.
+RESPONSE_SCHEMA = {
+    "name": "translations",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "translations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"id": {"type": "integer"}, "text": {"type": "string"}},
+                    "required": ["id", "text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["translations"],
+        "additionalProperties": False,
+    },
+}
+
 
 def translate(segments: list[Segment], source_language: str | None = None) -> list[Segment]:
     if source_language == "en":
@@ -96,13 +118,12 @@ def _request_llm(client: Groq, model: str, lines: list[Segment], context: list[S
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
-        response_format={"type": "json_object"},
+        response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},  # strict: no malformed JSON
         temperature=0.3,
         reasoning_effort="low",
     )
     data = json.loads(response.choices[0].message.content)
-    translations = data["translations"] if isinstance(data, dict) else data  # smaller models may drop the wrapper
-    return {int(t["id"]): t["text"].strip() for t in translations}
+    return {int(t["id"]): t["text"].strip() for t in data["translations"]}
 
 
 def _translate_google(segments: list[Segment]) -> None:
