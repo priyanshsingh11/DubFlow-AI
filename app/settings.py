@@ -16,6 +16,10 @@ TTS_CONCURRENCY = 8
 MAX_SPEEDUP = 1.3                # never speed a clip up more than this
 SAMPLE_RATE = 24000
 
+# Translation LLM when NVIDIA_API_KEY is set (takes priority over Groq; NVIDIA has no daily token limit).
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_MODEL = "nvidia/riva-translate-4b-instruct-v2"  # a translation model: one line per request, no JSON batches
+NVIDIA_CONCURRENCY = 4                                 # the free API allows ~40 requests/min; 429s are retried
 # Translation LLMs when GROQ_API_KEY is set (else Google Translate); the next one is used once a daily token limit is hit.
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 TRANSLATE_BATCH = 12                # segments per LLM request (small batches keep the model from merging lines)

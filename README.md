@@ -4,13 +4,14 @@ Turns a YouTube video in any language into an English-dubbed video.
 
 ```
 URL → download (yt-dlp) → extract audio (ffmpeg) → transcribe (Whisper large-v3 on Groq, local fallback)
-    → translate (Groq LLM, Google fallback) → synthesize (edge-tts)
+    → translate (NVIDIA Riva Translate or Groq LLM, Google fallback) → synthesize (edge-tts)
     → sync to original timestamps → replace audio (ffmpeg, video not re-encoded)
 ```
 
-With a `GROQ_API_KEY`, transcription and translation run on Groq (Whisper large-v3 and an LLM).
-Without one, transcription runs locally with `faster-whisper` and translation uses Google Translate.
-Text-to-speech uses an online service.
+- **Transcription:** Whisper large-v3 on Groq with a `GROQ_API_KEY`, otherwise locally with `faster-whisper`.
+- **Translation:** NVIDIA Riva Translate with an `NVIDIA_API_KEY`, otherwise a Groq LLM with a `GROQ_API_KEY`,
+  otherwise Google Translate.
+- **Text-to-speech:** an online service (Microsoft Edge TTS).
 
 ---
 
@@ -25,18 +26,30 @@ pip install -r requirements.txt
 Optional: install Node.js (`brew install node`). yt-dlp needs a JavaScript runtime to
 unlock some YouTube formats; it uses Deno or Node, whichever is installed.
 
-### API key (optional)
+### API keys (optional, recommended)
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root (it is ignored by git):
 
 ```
-GROQ_API_KEY=your_key_here
+GROQ_API_KEY=your_groq_key         # transcription (and translation if no NVIDIA key)
+NVIDIA_API_KEY=your_nvidia_key     # translation; get one at build.nvidia.com
 ```
 
-With a key, transcription uses Groq-hosted Whisper large-v3 and translation uses a Groq-hosted LLM.
-Without one, transcription runs locally (much slower on a Mac) and translation falls back to
-the free Google Translate endpoint. The key is strongly recommended: the local fallback and
-Google Translate give noticeably worse dubs, especially for Hindi. `.env` is ignored by git.
+| Keys set | Transcription | Translation |
+|----------|---------------|-------------|
+| both (recommended for long videos) | Groq Whisper large-v3 | NVIDIA Riva Translate |
+| `GROQ_API_KEY` only | Groq Whisper large-v3 | Groq `gpt-oss` LLM |
+| `NVIDIA_API_KEY` only | local `faster-whisper` | NVIDIA Riva Translate |
+| none | local `faster-whisper` | Google Translate |
+
+Without `GROQ_API_KEY`, transcription runs locally (much slower on a Mac) and gives noticeably
+worse results, especially for Hindi.
+
+**Which translator to use:** Groq's free tier has a daily token limit that runs out after about
+an hour of video, and its per-minute limit makes translation slow (~10 min for 45 min of video).
+NVIDIA has no daily limit and translated a 2-hour video (~1,250 lines) in about 7 minutes.
+The Groq LLM sees neighbouring lines and keeps each line within a word limit, so it can phrase
+lines more consistently and fit the timing better. Riva translates each line on its own.
 
 ## Run
 
@@ -54,7 +67,8 @@ Output: `output/<video_id>_en.mp4`.
 
 `app/pipeline.py` runs seven steps. Each one writes a file to `temp/<video_id>/`.
 If that file already exists, the step is skipped and marked `(cached)`, so an interrupted
-run resumes where it stopped when you rerun the same URL.
+run resumes where it stopped when you rerun the same URL. Translation, the longest step, also
+saves its progress to `translated.partial.json` as it goes, so even a half-finished translation resumes.
 
 | # | Step | Code | Output |
 |---|------|------|--------|
@@ -100,25 +114,54 @@ to the video.
 ### 4. Translate (`app/translator.py`)
 
 - **English audio:** the original text is kept and no translation happens.
-- **No `GROQ_API_KEY`:** each line goes through Google Translate (`deep-translator`).
-  The free endpoint allows about 5 requests per second, so there is a 0.25 s delay between
-  requests and a backoff of 5, 10, 20, 40 and 80 s when rate-limited. If it still fails,
-  the line is left silent instead of reading the untranslated text in an English voice.
-- **With `GROQ_API_KEY`:** lines are sent to the first of `GROQ_MODELS` in batches of `TRANSLATE_BATCH`:
-  - The prompt says the input is speech-recognition output from one continuous video. It may mix languages
-    and contain misheard words, and one sentence may span several lines. The model should translate for
-    meaning in natural spoken English, keep technical terms, and never add content.
-  - Each line gets a `max_words` limit: the time until the next line starts × `WORDS_PER_SECOND`.
-    This keeps the English short enough to fit the original timing.
-  - The previous 5 translated lines are sent as context for consistency.
-  - The response is requested as JSON (`temperature=0.3`, `reasoning_effort="low"`).
-  - The model sometimes merges lines and leaves ids out; batches are small for that reason. Missing
-    lines (or a batch whose JSON is invalid) are requested again, up to 3 attempts, and only
-    then sent to Google Translate.
-  - When a model's daily token limit is hit (200K tokens on the free tier, about one
-    hour of video), the rest of the run uses the next model in `GROQ_MODELS`.
-  - The Groq client retries up to 6 times on rate limits. On Groq's free tier (8,000 tokens per
-    minute) this rate limit is what sets the translation speed, about 10 minutes for a 45-minute video.
+- **Checkpointing:** progress is written to `translated.partial.json` (every 20 lines with NVIDIA,
+  every batch with Groq). A rerun loads it and translates only the missing lines. The file is
+  deleted once `translated.json` is written.
+
+#### With `NVIDIA_API_KEY`: Riva Translate (used first when set)
+
+- Model: `NVIDIA_MODEL` (`nvidia/riva-translate-4b-instruct-v2`), a model built for translation,
+  called through NVIDIA's OpenAI-compatible API.
+- **One line per request.** Given batches of lines as JSON, Riva dropped a third or more of
+  the lines and sometimes returned truncated JSON. Sent one sentence at a time, it is accurate
+  and takes under a second per line.
+- The system prompt says the input is Hinglish (Hindi mixed with English). The user prompt
+  follows NVIDIA's format, `What is the English translation of the sentence: …`, with no
+  trailing `?`. With one, replies ended in stray `?` or ", right?".
+- Lines with no Devanagari characters are already English and are kept as they are.
+  Riva sometimes "translated" these into another language (e.g. Polish).
+- `NVIDIA_CONCURRENCY` requests run in parallel. The free API allows about 40 requests per
+  minute. When rate-limited (HTTP 429), a line waits 5, 10, 20, 40, 60 s… and retries, up to
+  8 attempts, then falls back to Google Translate.
+- Limitation: Riva doesn't see neighbouring lines or the `max_words` limit, so some English lines
+  are longer than the original. The sync step speeds those up, but only to `MAX_SPEEDUP`.
+
+#### With `GROQ_API_KEY` only: LLM batches
+
+- Lines are sent to the first of `GROQ_MODELS` in batches of `TRANSLATE_BATCH`.
+- The prompt says the input is speech-recognition output from one continuous video. It may mix languages
+  and contain misheard words, and one sentence may span several lines. The model should translate for
+  meaning in natural spoken English, keep technical terms, and never add content.
+- Each line gets a `max_words` limit: the time until the next line starts × `WORDS_PER_SECOND`.
+  This keeps the English short enough to fit the original timing.
+- The previous 5 translated lines are sent as context for consistency.
+- The response uses Groq's strict JSON-schema mode (`{"translations": [{"id", "text"}]}`),
+  `temperature=0.3`, `reasoning_effort="low"`.
+- The model sometimes merges lines and leaves ids out; batches are small for that reason.
+  Missing lines are requested again, up to 3 attempts, and only then sent to Google Translate.
+- If Groq rejects a reply as invalid JSON (`json_validate_failed`, most common with long replies
+  from `gpt-oss-20b`), the batch is split in half and each half is retried, down to single lines.
+- When a model's daily token limit is hit (200K tokens on the free tier, about one
+  hour of video), the rest of the run uses the next model in `GROQ_MODELS`.
+- The Groq client retries up to 6 times on rate limits. On Groq's free tier (8,000 tokens per
+  minute) this rate limit is what sets the translation speed, about 10 minutes for a 45-minute video.
+
+#### With neither key: Google Translate
+
+- Each line goes through Google Translate (`deep-translator`).
+- The free endpoint allows about 5 requests per second, so there is a 0.25 s delay between
+  requests and a backoff of 5, 10, 20, 40 and 80 s when rate-limited.
+- If it still fails, the line is left silent instead of reading the untranslated text in an English voice.
 
 ### 5. Synthesize speech (`app/tts.py`)
 
@@ -228,8 +271,10 @@ rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-small
 | `TTS_CONCURRENCY` | `8` | Parallel TTS requests |
 | `MAX_SPEEDUP` | `1.3` | Maximum speed-up for a clip that's too long |
 | `SAMPLE_RATE` | `24000` | Sample rate of the dubbed voice track |
+| `NVIDIA_MODEL` | `"nvidia/riva-translate-4b-instruct-v2"` | Translation model when `NVIDIA_API_KEY` is set |
+| `NVIDIA_CONCURRENCY` | `4` | Parallel NVIDIA translation requests |
 | `GROQ_MODELS` | `["openai/gpt-oss-120b", "openai/gpt-oss-20b"]` | Translation LLMs, in order of preference |
-| `TRANSLATE_BATCH` | `12` | Segments per LLM request |
+| `TRANSLATE_BATCH` | `12` | Segments per Groq LLM request |
 | `WORDS_PER_SECOND` | `2.6` | English speaking pace, used for `max_words` |
 
 ## Project layout
@@ -241,7 +286,7 @@ app/
   downloader.py      yt-dlp download and video ID lookup
   ffmpeg.py          ffmpeg / ffprobe helpers
   transcriber.py     Whisper transcription (Groq or local) and splitting into dub lines
-  translator.py      Groq LLM translation with Google Translate fallback
+  translator.py      NVIDIA Riva / Groq LLM translation, checkpointing, Google Translate fallback
   tts.py             edge-tts speech synthesis
   synchronizer.py    places and speeds up clips to match timing
   models.py          Segment dataclass and JSON save/load
@@ -253,14 +298,18 @@ output/              finished dubbed videos
 ## Troubleshooting
 
 - **Re-do a step:** delete its file in `temp/<video_id>/`, e.g. delete `translated.json`
-  to translate again. Also delete the outputs of every later step (`tts/`, `voice_track.wav`
+  (and `translated.partial.json`, if present) to translate again. Also delete the outputs of every later step (`tts/`, `voice_track.wav`
   and the output video), or they will be reused with the old text.
 - **Start over completely:** delete `temp/<video_id>/`.
 - **`ffmpeg` not found:** run `brew install ffmpeg`.
 - **YouTube download fails or formats are missing:** update yt-dlp with
   `pip install -U "yt-dlp[default]"` and make sure Node or Deno is installed.
-- **"Google Translate still rate-limited":** add a `GROQ_API_KEY`, or wait and rerun;
+- **"Google Translate still rate-limited":** add an `NVIDIA_API_KEY` or `GROQ_API_KEY`, or wait and rerun;
   finished steps are cached.
+- **"daily token limit reached" on Groq:** add an `NVIDIA_API_KEY` (no daily limit), or wait for
+  the limit to reset. Press Ctrl+C at any time; the next run continues from the saved progress.
+- **Translation is slow:** with Groq, the per-minute token limit sets the pace; use NVIDIA instead.
+  With NVIDIA, frequent 429 retries mean `NVIDIA_CONCURRENCY` is too high for your account.
 - **Transcription too slow (no key):** set a `GROQ_API_KEY`, or use a smaller `WHISPER_MODEL`
   (accuracy drops sharply for non-English audio).
 - **Dubbed speech sounds rushed or overlaps:** lower `WORDS_PER_SECOND` so translations

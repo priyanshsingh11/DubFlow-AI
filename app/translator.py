@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from deep_translator import GoogleTranslator
 from deep_translator.exceptions import TooManyRequests
 from groq import BadRequestError, Groq, RateLimitError
+from openai import OpenAI
+from openai import RateLimitError as OpenAIRateLimitError
 
 from app import settings
 from app.models import Segment, load_segments, save_segments
@@ -56,19 +60,23 @@ def translate(segments: list[Segment], source_language: str | None = None,
             seg.translated_text = seg.source_text
         return segments
 
+    if checkpoint and checkpoint.exists():
+        done = {s.id: s.translated_text for s in load_segments(checkpoint)}
+        for seg in segments:
+            seg.translated_text = done.get(seg.id, "")
+        print(f"       resuming from {sum(1 for t in done.values() if t)} translated segments")
+
+    if os.getenv("NVIDIA_API_KEY"):
+        _translate_nvidia(segments, checkpoint)
+        return segments
     if not os.getenv("GROQ_API_KEY"):
-        print("       GROQ_API_KEY not set, using Google Translate")
+        print("       no NVIDIA_API_KEY or GROQ_API_KEY set, using Google Translate")
         _translate_google(segments)
         return segments
 
     client = Groq(max_retries=6)  # retries with backoff on rate limits
     max_words = _max_words(segments)
     models = list(settings.GROQ_MODELS)
-    if checkpoint and checkpoint.exists():
-        done = {s.id: s.translated_text for s in load_segments(checkpoint)}
-        for seg in segments:
-            seg.translated_text = done.get(seg.id, "")
-        print(f"       resuming from {sum(1 for t in done.values() if t)} translated segments")
     for start in range(0, len(segments), settings.TRANSLATE_BATCH):
         batch = segments[start:start + settings.TRANSLATE_BATCH]
         context = segments[max(0, start - 5):start]
@@ -79,6 +87,54 @@ def translate(segments: list[Segment], source_language: str | None = None,
         print(f"\r       {min(start + len(batch), len(segments))}/{len(segments)} segments", end="", flush=True)
     print()
     return segments
+
+
+RIVA_SYSTEM = ("You are an expert at translating text from Hindi to English. The text is spoken Hindi mixed with "
+               "English words (Hinglish); translate it into natural English.")
+DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+
+
+def _translate_nvidia(segments: list[Segment], checkpoint: Path | None) -> None:
+    """Riva Translate, one line per request (it drops and garbles lines when given JSON batches)."""
+    print(f"       using {settings.NVIDIA_MODEL}")
+    todo = [s for s in segments if s.source_text and not s.translated_text]
+    for seg in todo:
+        if not DEVANAGARI.search(seg.source_text):  # already English; Riva sometimes "translates" these into Polish
+            seg.translated_text = seg.source_text
+    todo = [s for s in todo if not s.translated_text]
+    client = OpenAI(base_url=settings.NVIDIA_BASE_URL, api_key=os.environ["NVIDIA_API_KEY"], max_retries=2, timeout=60)
+    done = len(segments) - len(todo)
+    with ThreadPoolExecutor(settings.NVIDIA_CONCURRENCY) as pool:
+        for i, _ in enumerate(pool.map(lambda seg: _riva_one(client, seg), todo), 1):
+            print(f"\r       {done + i}/{len(segments)} segments", end="", flush=True)
+            if checkpoint and i % 20 == 0:
+                save_segments(segments, checkpoint)
+    print()
+
+
+def _riva_one(client: OpenAI, seg: Segment, attempts: int = 8) -> None:
+    for attempt in range(attempts):
+        try:
+            response = client.chat.completions.create(
+                model=settings.NVIDIA_MODEL,
+                messages=[
+                    {"role": "system", "content": RIVA_SYSTEM},
+                    # no trailing "?": with one, replies end in stray "?" or ", right?"
+                    {"role": "user", "content": f"What is the English translation of the sentence: {seg.source_text}"},
+                ],
+                temperature=0.1,
+                max_tokens=400,
+            )
+            seg.translated_text = (response.choices[0].message.content or "").strip()
+            if seg.translated_text:
+                return
+        except OpenAIRateLimitError:
+            time.sleep(min(60, 5 * 2 ** attempt))  # 5, 10, 20, 40, 60s...
+        except Exception as e:
+            print(f"\n       NVIDIA request failed ({e}), retrying")
+            time.sleep(5)
+    print(f"\n       NVIDIA gave no translation for line {seg.id}, using Google Translate")
+    _translate_google([seg])
 
 
 def _max_words(segments: list[Segment]) -> dict[int, int]:

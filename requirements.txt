@@ -5,4 +5,5 @@ edge-tts
 pydub
 numpy
 groq
+openai
 python-dotenv
