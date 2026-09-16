@@ -4,3 +4,5 @@ deep-translator
 edge-tts
 pydub
 numpy
+groq
+python-dotenv
