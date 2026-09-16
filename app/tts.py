@@ -15,6 +15,8 @@ def clip_path(tts_dir: Path, seg: Segment) -> Path:
 def synthesize(segments: list[Segment], tts_dir: Path, voice: str, concurrency: int) -> None:
     tts_dir.mkdir(exist_ok=True)
     todo = [s for s in segments if s.translated_text and not clip_path(tts_dir, s).exists()]
+    if not todo:
+        return
 
     async def main():
         sem = asyncio.Semaphore(concurrency)

@@ -24,6 +24,16 @@ def stage(label: str, output: Optional[Path], fn: Callable[[], None]) -> None:
     print(f"       done in {time.time() - started:.1f}s")
 
 
+def _transcribe(audio: Path, segments_json: Path, language_txt: Path) -> None:
+    segments, language = transcribe(audio, settings.WHISPER_MODEL)
+    language_txt.write_text(language)
+    save_segments(segments, segments_json)
+
+
+def _read(path: Path) -> Optional[str]:
+    return path.read_text().strip() if path.exists() else None
+
+
 def run(url: str) -> Path:
     started = time.time()
     video_id = get_video_id(url)
@@ -34,6 +44,7 @@ def run(url: str) -> Path:
     video = work / "video.mp4"
     audio = work / "audio.wav"
     segments_json = work / "segments.json"
+    language_txt = work / "language.txt"
     translated_json = work / "translated.json"
     tts_dir = work / "tts"
     voice = work / "voice_track.wav"
@@ -43,9 +54,9 @@ def run(url: str) -> Path:
     stage("[2/7] Extracting audio", audio,
           lambda: ffmpeg.run("-i", video, "-vn", "-ac", "1", "-ar", "16000", audio))
     stage("[3/7] Transcribing", segments_json,
-          lambda: save_segments(transcribe(audio, settings.WHISPER_MODEL), segments_json))
+          lambda: _transcribe(audio, segments_json, language_txt))
     stage("[4/7] Translating to English", translated_json,
-          lambda: save_segments(translate(load_segments(segments_json)), translated_json))
+          lambda: save_segments(translate(load_segments(segments_json), _read(language_txt)), translated_json))
     stage("[5/7] Synthesizing English speech", None,
           lambda: synthesize(load_segments(translated_json), tts_dir,
                              settings.TTS_VOICE, settings.TTS_CONCURRENCY))
