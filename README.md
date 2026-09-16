@@ -63,6 +63,74 @@ Output: `output/<video_id>_en.mp4`.
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+    URL([YouTube URL]) --> DL[downloader.py<br/>yt-dlp]
+    DL -->|video.mp4| AX[ffmpeg.py<br/>extract audio]
+    AX -->|audio.wav 16 kHz mono| TR[transcriber.py<br/>Silero VAD + Whisper]
+    TR -->|segments.json| TL[translator.py<br/>LLM translation]
+    TL -->|translated.json| TTS[tts.py<br/>edge-tts]
+    TTS -->|tts/NNNN.mp3| SY[synchronizer.py<br/>place + atempo]
+    SY -->|voice_track.wav| MX[ffmpeg.py<br/>replace audio]
+    DL -.->|video stream, not re-encoded| MX
+    MX --> OUT([output/&lt;id&gt;_en.mp4])
+
+    TR -.-> G1[(Groq Whisper large-v3)]
+    TR -.->|no key / request fails| L1[(local faster-whisper)]
+    TL -.-> N1[(NVIDIA Riva Translate)]
+    TL -.-> G2[(Groq LLMs)]
+    TL -.->|no key / last resort| GT[(Google Translate)]
+    TTS -.-> MS[(Microsoft Edge TTS)]
+```
+
+### Layers
+
+| Layer | Files | Role |
+|-------|-------|------|
+| Entry point | `main.py` | Loads `.env`, reads the URL, calls `pipeline.run()` |
+| Orchestration | `app/pipeline.py` | Runs the 7 steps in order; `stage()` skips a step whose output file exists, so runs can resume |
+| Steps | `downloader.py`, `transcriber.py`, `translator.py`, `tts.py`, `synchronizer.py` | One module per step; each reads the previous step's file and writes its own |
+| Shared helpers | `app/ffmpeg.py`, `app/models.py` | ffmpeg/ffprobe wrappers; the `Segment` dataclass and JSON save/load |
+| Configuration | `app/settings.py` | Models, timing limits, voices, concurrency |
+
+### Data model
+
+Every step after transcription passes around a list of `Segment`s (`app/models.py`):
+
+```python
+Segment(id, start, end, source_text, translated_text="", speaker="SPEAKER_0")
+```
+
+`start`/`end` are the original timestamps; they are what the synchronizer uses to place each English clip.
+`speaker` is always `SPEAKER_0` for now. It exists so multi-speaker dubbing can be added later without
+changing the data format.
+
+### Services and fallbacks
+
+| Step | Preferred | Fallback |
+|------|-----------|----------|
+| Transcribe | Groq `whisper-large-v3` (`GROQ_API_KEY`) | Local `faster-whisper` `large-v3-turbo` |
+| Translate | NVIDIA `riva-translate-4b-instruct-v2` (`NVIDIA_API_KEY`), else Groq `GROQ_MODELS` (`GROQ_API_KEY`) | Google Translate, per line |
+| Speech | Microsoft Edge TTS | none |
+
+### Key design decisions
+
+- **Files as the interface between steps.** Each step writes to `temp/<video_id>/`, which gives resume after
+  a crash, easy debugging (inspect or edit `translated.json` by hand), and re-running a single step.
+- **LLM translation, not plain machine translation.** The input is noisy speech-recognition text that can mix
+  languages. The LLM gets batches with context and a per-line `max_words` limit so the English fits the timing.
+- **Place clips by timestamp.** Each clip starts at its segment's original `start`, so timing errors
+  don't accumulate over a long video.
+- **Time-stretch, capped.** A clip that is too long first uses the silence before the next line, then is
+  sped up with `atempo` (pitch unchanged), never beyond `MAX_SPEEDUP` = 1.3×.
+- **Video is copied, not re-encoded.** Only the audio track is replaced, which is fast and lossless.
+- **Deferred: multiple speakers and voice cloning.** Both need extra models (diarization, a cloning TTS),
+  adding cost, latency and failure points. The `speaker` field is the hook for adding them.
+
+---
+
 ## How it works
 
 `app/pipeline.py` runs seven steps. Each one writes a file to `temp/<video_id>/`.
