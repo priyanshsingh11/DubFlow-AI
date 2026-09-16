@@ -30,6 +30,13 @@ def _transcribe(audio: Path, segments_json: Path, language_txt: Path) -> None:
     save_segments(segments, segments_json)
 
 
+def _translate(segments_json: Path, language_txt: Path, translated_json: Path) -> None:
+    partial = translated_json.with_suffix(".partial.json")
+    segments = translate(load_segments(segments_json), _read(language_txt), checkpoint=partial)
+    save_segments(segments, translated_json)
+    partial.unlink(missing_ok=True)
+
+
 def _read(path: Path) -> Optional[str]:
     return path.read_text().strip() if path.exists() else None
 
@@ -56,7 +63,7 @@ def run(url: str) -> Path:
     stage("[3/7] Transcribing", segments_json,
           lambda: _transcribe(audio, segments_json, language_txt))
     stage("[4/7] Translating to English", translated_json,
-          lambda: save_segments(translate(load_segments(segments_json), _read(language_txt)), translated_json))
+          lambda: _translate(segments_json, language_txt, translated_json))
     stage("[5/7] Synthesizing English speech", None,
           lambda: synthesize(load_segments(translated_json), tts_dir,
                              settings.TTS_VOICE, settings.TTS_CONCURRENCY))

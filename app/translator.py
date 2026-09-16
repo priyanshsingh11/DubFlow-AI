@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 from deep_translator import GoogleTranslator
 from deep_translator.exceptions import TooManyRequests
-from groq import Groq, RateLimitError
+from groq import BadRequestError, Groq, RateLimitError
 
 from app import settings
-from app.models import Segment
+from app.models import Segment, load_segments, save_segments
 
 SYSTEM_PROMPT = """You translate video dialogue into English for dubbing.
 - The lines come from automatic speech recognition, in order, from one continuous video. They may mix languages
@@ -23,7 +24,7 @@ SYSTEM_PROMPT = """You translate video dialogue into English for dubbing.
 - previous_lines are context only; do not translate them again.
 Return JSON: {"translations": [{"id": <id>, "text": "<english>"}]} with exactly one entry per line id."""
 
-# Constrained decoding: the model can only emit JSON matching this, so no json_validate_failed errors.
+# Constrained decoding keeps replies to this shape (Groq can still reject a long reply as json_validate_failed).
 RESPONSE_SCHEMA = {
     "name": "translations",
     "strict": True,
@@ -46,7 +47,9 @@ RESPONSE_SCHEMA = {
 }
 
 
-def translate(segments: list[Segment], source_language: str | None = None) -> list[Segment]:
+def translate(segments: list[Segment], source_language: str | None = None,
+              checkpoint: Path | None = None) -> list[Segment]:
+    """checkpoint: progress is saved there after every batch, and a rerun continues from it."""
     if source_language == "en":
         print("       audio is already English, keeping original text")
         for seg in segments:
@@ -61,10 +64,18 @@ def translate(segments: list[Segment], source_language: str | None = None) -> li
     client = Groq(max_retries=6)  # retries with backoff on rate limits
     max_words = _max_words(segments)
     models = list(settings.GROQ_MODELS)
+    if checkpoint and checkpoint.exists():
+        done = {s.id: s.translated_text for s in load_segments(checkpoint)}
+        for seg in segments:
+            seg.translated_text = done.get(seg.id, "")
+        print(f"       resuming from {sum(1 for t in done.values() if t)} translated segments")
     for start in range(0, len(segments), settings.TRANSLATE_BATCH):
         batch = segments[start:start + settings.TRANSLATE_BATCH]
         context = segments[max(0, start - 5):start]
-        _translate_llm(client, models, batch, context, max_words)
+        if any(s.source_text and not s.translated_text for s in batch):
+            _translate_llm(client, models, batch, context, max_words)
+            if checkpoint:
+                save_segments(segments, checkpoint)
         print(f"\r       {min(start + len(batch), len(segments))}/{len(segments)} segments", end="", flush=True)
     print()
     return segments
@@ -82,7 +93,7 @@ def _max_words(segments: list[Segment]) -> dict[int, int]:
 def _translate_llm(client: Groq, models: list[str], batch: list[Segment], context: list[Segment],
                    max_words: dict[int, int], attempts: int = 3) -> None:
     """Ask the LLM again for any lines it skipped or merged; Google Translate is the last resort."""
-    todo = [s for s in batch if s.source_text]
+    todo = [s for s in batch if s.source_text and not s.translated_text]
     for _ in range(attempts):
         if not todo:
             return
@@ -95,6 +106,16 @@ def _translate_llm(client: Groq, models: list[str], batch: list[Segment], contex
             else:
                 print(f"\n       LLM rate-limited ({e}), retrying")
             by_id = {}
+        except BadRequestError as e:
+            if "json_validate_failed" not in str(e) or len(todo) == 1:
+                print(f"\n       LLM request failed ({e}), retrying")
+                by_id = {}
+            else:  # long replies are the ones that come back malformed, so ask for half at a time
+                print(f"\n       LLM returned invalid JSON for {len(todo)} lines, retrying in two smaller batches")
+                half = len(todo) // 2
+                _translate_llm(client, models, todo[:half], context, max_words, attempts)
+                _translate_llm(client, models, todo[half:], (context + todo[:half])[-5:], max_words, attempts)
+                return
         except Exception as e:  # e.g. invalid JSON; one bad reply shouldn't stop a 2-hour run
             print(f"\n       LLM request failed ({e}), retrying")
             by_id = {}
@@ -118,7 +139,7 @@ def _request_llm(client: Groq, model: str, lines: list[Segment], context: list[S
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
-        response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},  # strict: no malformed JSON
+        response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
         temperature=0.3,
         reasoning_effort="low",
     )
